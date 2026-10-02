@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   Braces,
   Check,
@@ -7,12 +7,14 @@ import {
   Clipboard,
   Code2,
   Download,
+  Expand,
   FileCode2,
   FileJson,
   FileText,
   FileUp,
   LoaderCircle,
   PanelTop,
+  Shrink,
   Settings2,
   Sparkles,
   Trash2,
@@ -20,6 +22,11 @@ import {
 } from 'lucide-react';
 
 const API_PATH = '/documents/process';
+const UTILITY_PATHS = {
+  jwtDecode: '/utilities/jwt/decode',
+  base64Encode: '/utilities/base64/url/encode',
+  base64Decode: '/utilities/base64/url/decode',
+};
 const MAX_BYTES = 1_048_576;
 const FORMATS = [
   { id: 'json', label: 'JSON', extension: 'json', icon: Braces },
@@ -33,7 +40,7 @@ const CONTENT_TYPES = {
   xml: 'application/xml',
   markdown: 'text/markdown',
 };
-const DEFAULT_API_URL = import.meta.env.VITE_DOCUMENT_API_URL ?? 'https://fictional-giggle-594p4jw4q6xh4q9j-8000.app.github.dev';
+const DEFAULT_API_URL = import.meta.env.VITE_DOCUMENT_API_URL ?? 'http://127.0.0.1:8000';
 
 function getInitialApiUrl() {
   try {
@@ -43,9 +50,15 @@ function getInitialApiUrl() {
   }
 }
 
-function getEndpoint(url) {
-  const normalized = url.trim().replace(/\/+$/, '');
-  return normalized.endsWith(API_PATH) ? normalized : `${normalized}${API_PATH}`;
+function getEndpoint(url, path = API_PATH) {
+  let baseUrl = url.trim().replace(/\/+$/, '');
+  for (const endpointPath of [API_PATH, ...Object.values(UTILITY_PATHS)]) {
+    if (baseUrl.endsWith(endpointPath)) {
+      baseUrl = baseUrl.slice(0, -endpointPath.length);
+      break;
+    }
+  }
+  return `${baseUrl}${path}`;
 }
 
 function getPreviewDocument(markup) {
@@ -59,12 +72,147 @@ function getPreviewDocument(markup) {
   </style></head><body>${markup}</body></html>`;
 }
 
+function createJsonTree(value, label = '$', id = 'json-root') {
+  if (Array.isArray(value)) {
+    const children = value.map((item, index) => createJsonTree(item, `[${index}]`, `${id}-${index}`));
+    return {
+      id,
+      label,
+      opening: '[',
+      closing: ']',
+      children,
+      value: children.length ? undefined : '[]',
+    };
+  }
+
+  if (value !== null && typeof value === 'object') {
+    const children = Object.entries(value).map(([key, item], index) => (
+      createJsonTree(item, `${JSON.stringify(key)}:`, `${id}-${index}`)
+    ));
+    return {
+      id,
+      label,
+      opening: '{',
+      closing: '}',
+      children,
+      value: children.length ? undefined : '{}',
+    };
+  }
+
+  return {
+    id,
+    label,
+    value: JSON.stringify(value),
+    valueType: value === null ? 'null' : typeof value,
+  };
+}
+
+function createXmlTree(xml) {
+  const document = new DOMParser().parseFromString(xml, 'application/xml');
+  const parseError = document.querySelector('parsererror');
+  if (parseError) throw new Error(parseError.textContent || 'The XML could not be parsed.');
+
+  function createNode(node, id) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const attributes = Array.from(node.attributes, (attribute) => (
+        ` ${attribute.name}="${attribute.value}"`
+      )).join('');
+      const children = Array.from(node.childNodes)
+        .filter((child) => child.nodeType !== Node.TEXT_NODE || child.nodeValue.trim())
+        .map((child, index) => createNode(child, `${id}-${index}`));
+      return {
+        id,
+        label: `<${node.nodeName}${attributes}${children.length ? '>' : ' />'}`,
+        closing: children.length ? `</${node.nodeName}>` : '',
+        children,
+      };
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      return { id, label: node.nodeValue, valueType: 'text' };
+    }
+
+    if (node.nodeType === Node.CDATA_SECTION_NODE) {
+      return { id, label: `<![CDATA[${node.nodeValue}]]>`, valueType: 'text' };
+    }
+
+    if (node.nodeType === Node.COMMENT_NODE) {
+      return { id, label: `<!-- ${node.nodeValue} -->`, valueType: 'text' };
+    }
+
+    if (node.nodeType === Node.PROCESSING_INSTRUCTION_NODE) {
+      return { id, label: `<?${node.nodeName} ${node.nodeValue}?>`, valueType: 'text' };
+    }
+
+    if (node.nodeType === Node.DOCUMENT_TYPE_NODE) {
+      return { id, label: `<!DOCTYPE ${node.nodeName}>`, valueType: 'text' };
+    }
+
+    return { id, label: node.nodeName, valueType: 'text' };
+  }
+
+  return {
+    id: 'xml-root',
+    label: 'XML document',
+    children: Array.from(document.childNodes)
+      .filter((node) => node.nodeType !== Node.TEXT_NODE || node.nodeValue.trim())
+      .map((node, index) => createNode(node, `xml-${index}`)),
+  };
+}
+
+function collectBranchIds(node) {
+  if (!node.children?.length) return [];
+  return [node.id, ...node.children.flatMap(collectBranchIds)];
+}
+
+function TreeNode({ node, expandedNodes, setExpandedNodes }) {
+  const isBranch = Boolean(node.children?.length);
+  const isExpanded = expandedNodes[node.id] ?? true;
+
+  return (
+    <div className="tree-node">
+      <div className="tree-row">
+        {isBranch ? (
+          <button
+            className="tree-toggle"
+            type="button"
+            aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${node.label}`}
+            aria-expanded={isExpanded}
+            onClick={() => setExpandedNodes((current) => ({ ...current, [node.id]: !isExpanded }))}
+          >
+            {isExpanded ? '-' : '+'}
+          </button>
+        ) : <span className="tree-toggle-placeholder" />}
+        <span className={`tree-label ${node.valueType ? `tree-value-${node.valueType}` : ''}`}>{node.label}</span>
+        {node.opening && <span className="tree-delimiter">{node.opening}</span>}
+        {node.value !== undefined && <span className={`tree-value tree-value-${node.valueType || 'container'}`}>{node.value}</span>}
+        {isBranch && !isExpanded && <span className="tree-summary">... {node.closing}</span>}
+      </div>
+      {isBranch && isExpanded && (
+        <div className="tree-children">
+          {node.children.map((child) => (
+            <TreeNode
+              key={child.id}
+              node={child}
+              expandedNodes={expandedNodes}
+              setExpandedNodes={setExpandedNodes}
+            />
+          ))}
+          {node.closing && <div className="tree-closing">{node.closing}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
+  const [toolMode, setToolMode] = useState('format');
   const [format, setFormat] = useState('json');
   const [fileName, setFileName] = useState('untitled.json');
   const [content, setContent] = useState('');
   const [result, setResult] = useState(null);
-  const [outputMode, setOutputMode] = useState('source');
+  const [outputMode, setOutputMode] = useState('tree');
+  const [expandedNodes, setExpandedNodes] = useState({});
   const [apiUrl, setApiUrl] = useState(getInitialApiUrl);
   const [endpointDraft, setEndpointDraft] = useState(getInitialApiUrl);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -75,6 +223,31 @@ function App() {
 
   const byteCount = new TextEncoder().encode(content).length;
   const activeFormat = FORMATS.find((item) => item.id === format);
+  const isFormatter = toolMode === 'format';
+  const supportsTree = isFormatter && (format === 'json' || format === 'xml');
+  const supportsPreview = isFormatter && (format === 'html' || format === 'markdown');
+  const toolDetails = {
+    format: { label: `${activeFormat.label} formatter`, input: `Unformatted ${activeFormat.label} content`, placeholder: `Paste your ${activeFormat.label} here...` },
+    jwtDecode: { label: 'JWT decoder', input: 'JWT token', placeholder: 'Paste a JWT to decode...' },
+    base64Encode: { label: 'Base64 URL encoder', input: 'Text to encode', placeholder: 'Enter text to Base64 URL-encode...' },
+    base64Decode: { label: 'Base64 URL decoder', input: 'Base64 text to decode', placeholder: 'Paste Base64 URL-encoded text...' },
+  }[toolMode];
+  const structuredTree = useMemo(() => {
+    if (!result || !supportsTree) return null;
+    try {
+      return {
+        tree: format === 'json'
+          ? createJsonTree(JSON.parse(result.formattedContent))
+          : createXmlTree(result.formattedContent),
+        error: '',
+      };
+    } catch (treeError) {
+      return {
+        tree: null,
+        error: treeError instanceof Error ? treeError.message : 'Could not parse the formatted document.',
+      };
+    }
+  }, [format, result, supportsTree]);
 
   function updateContent(value) {
     setContent(value);
@@ -84,6 +257,7 @@ function App() {
   }
 
   function selectFormat(nextFormat) {
+    setToolMode('format');
     setFormat(nextFormat);
     setFileName((current) => {
       const baseName = current.replace(/\.[^.]+$/, '') || 'untitled';
@@ -92,14 +266,24 @@ function App() {
     });
     setResult(null);
     setError('');
-    setOutputMode(nextFormat === 'html' || nextFormat === 'markdown' ? 'preview' : 'source');
+    setOutputMode(nextFormat === 'html' || nextFormat === 'markdown' ? 'preview' : 'tree');
+  }
+
+  function selectTool(nextTool) {
+    setToolMode(nextTool);
+    setResult(null);
+    setError('');
+    setNotice('');
+    setOutputMode(nextTool === 'format'
+      ? (format === 'html' || format === 'markdown' ? 'preview' : 'tree')
+      : 'source');
   }
 
   async function processDocument() {
     setError('');
     setNotice('');
     if (!content.trim()) {
-      setError('Add some content before formatting.');
+      setError(`Add some content before using the ${toolDetails.label}.`);
       return;
     }
     if (!apiUrl.trim()) {
@@ -108,21 +292,27 @@ function App() {
       return;
     }
     if (byteCount > MAX_BYTES) {
-      setError('This document is over the 1 MiB limit.');
+      setError('This input is over the 1 MiB limit.');
       return;
     }
 
     setBusy(true);
     setResult(null);
+    setExpandedNodes({});
     try {
-      const response = await fetch(getEndpoint(apiUrl), {
+      const isUtility = toolMode !== 'format';
+      const path = isUtility ? UTILITY_PATHS[toolMode] : API_PATH;
+      const body = toolMode === 'jwtDecode'
+        ? { token: content }
+        : toolMode === 'base64Encode'
+          ? { text: content }
+          : toolMode === 'base64Decode'
+            ? { encoded: content }
+            : { fileName, content, contentType: CONTENT_TYPES[format] };
+      const response = await fetch(getEndpoint(apiUrl, path), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fileName,
-          content,
-          contentType: CONTENT_TYPES[format],
-        }),
+        body: JSON.stringify(body),
       });
       const responseText = await response.text();
       let payload = {};
@@ -138,9 +328,37 @@ function App() {
         throw new Error(payload.error || `Request failed (${response.status}).`);
       }
       if (!responseText) throw new Error('The API returned an empty response.');
-      setResult(payload);
-      setOutputMode(format === 'html' || format === 'markdown' ? 'preview' : 'source');
-      setNotice('Document processed');
+      if (toolMode === 'jwtDecode') {
+        if (
+          !payload
+          || typeof payload !== 'object'
+          || !('header' in payload)
+          || !('payload' in payload)
+          || typeof payload.signature !== 'string'
+          || typeof payload.verified !== 'boolean'
+        ) {
+          throw new Error('The API response did not include the expected decoded JWT fields.');
+        }
+        setResult({
+          formattedContent: JSON.stringify(payload, null, 2),
+          fileName: 'decoded-jwt.json',
+          characterCount: content.length,
+        });
+        setOutputMode('source');
+      } else if (toolMode === 'base64Encode' || toolMode === 'base64Decode') {
+        const output = toolMode === 'base64Encode' ? payload.encoded : payload.decoded;
+        if (typeof output !== 'string') throw new Error('The API response did not include the expected output.');
+        setResult({
+          formattedContent: output,
+          fileName: toolMode === 'base64Encode' ? 'encoded.txt' : 'decoded.txt',
+          characterCount: content.length,
+        });
+        setOutputMode('source');
+      } else {
+        setResult(payload);
+        setOutputMode(format === 'html' || format === 'markdown' ? 'preview' : 'tree');
+      }
+      setNotice(isUtility ? `${toolDetails.label} complete` : 'Document processed');
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Could not reach the dev-utils API.');
     } finally {
@@ -153,7 +371,7 @@ function App() {
     const value = outputMode === 'preview' ? result.previewHtml : result.formattedContent;
     try {
       await navigator.clipboard.writeText(value);
-      setNotice(outputMode === 'preview' ? 'Preview markup copied' : 'Formatted source copied');
+      setNotice(outputMode === 'preview' ? 'Preview markup copied' : isFormatter ? 'Formatted source copied' : 'Result copied');
     } catch {
       setError('Clipboard access is unavailable in this browser.');
     }
@@ -198,7 +416,7 @@ function App() {
     setContent(await file.text());
     setResult(null);
     setError('');
-    setOutputMode(matchingFormat.id === 'html' || matchingFormat.id === 'markdown' ? 'preview' : 'source');
+    setOutputMode(matchingFormat.id === 'html' || matchingFormat.id === 'markdown' ? 'preview' : 'tree');
     event.target.value = '';
   }
 
@@ -244,27 +462,35 @@ function App() {
           <div className="format-count"><span>04</span> FORMATS</div>
         </div>
 
-        <nav className="format-tabs" aria-label="Document format">
+        <nav className="format-tabs" aria-label="Developer tools">
           {FORMATS.map(({ id, label, icon: Icon }) => (
-            <button className={`format-tab ${format === id ? 'active' : ''}`} type="button" key={id} aria-pressed={format === id} onClick={() => selectFormat(id)}>
+            <button className={`format-tab ${isFormatter && format === id ? 'active' : ''}`} type="button" key={id} aria-pressed={isFormatter && format === id} onClick={() => selectFormat(id)}>
               <Icon size={16} strokeWidth={1.9} />
               <span>{label}</span>
             </button>
           ))}
-          <span className="tabs-spacer" />
-          <button className="subtle-action upload-action" type="button" onClick={() => fileInputRef.current?.click()}>
-            <FileUp size={15} /><span>Open file</span>
-          </button>
-          <input ref={fileInputRef} className="visually-hidden" type="file" accept=".json,.html,.htm,.xml,.md,.markdown" onChange={loadFile} />
+          <span className="tool-divider" />
+          <button className={`utility-tab ${toolMode === 'jwtDecode' ? 'active' : ''}`} type="button" aria-pressed={toolMode === 'jwtDecode'} onClick={() => selectTool('jwtDecode')}>JWT decode</button>
+          <button className={`utility-tab ${toolMode === 'base64Encode' ? 'active' : ''}`} type="button" aria-pressed={toolMode === 'base64Encode'} onClick={() => selectTool('base64Encode')}>Base64 encode</button>
+          <button className={`utility-tab ${toolMode === 'base64Decode' ? 'active' : ''}`} type="button" aria-pressed={toolMode === 'base64Decode'} onClick={() => selectTool('base64Decode')}>Base64 decode</button>
+          {isFormatter && <span className="tabs-spacer" />}
+          {isFormatter && (
+            <>
+              <button className="subtle-action upload-action" type="button" onClick={() => fileInputRef.current?.click()}>
+                <FileUp size={15} /><span>Open file</span>
+              </button>
+              <input ref={fileInputRef} className="visually-hidden" type="file" accept=".json,.html,.htm,.xml,.md,.markdown" onChange={loadFile} />
+            </>
+          )}
         </nav>
 
-        <section className="editor-grid" aria-label={`${activeFormat.label} formatter`}>
+        <section className="editor-grid" aria-label={toolDetails.label}>
           <article className="editor-panel input-panel">
             <div className="panel-heading">
               <div className="panel-title-group">
                 <span className="panel-index">01</span>
                 <h2>Input</h2>
-                <span className="panel-caption">Paste or write your document</span>
+                <span className="panel-caption">{isFormatter ? 'Paste or write your document' : toolDetails.label}</span>
               </div>
               <div className="panel-tools">
                 <button className="icon-button" type="button" aria-label="Clear input" title="Clear input" onClick={() => { updateContent(''); setFileName(`untitled.${activeFormat.extension}`); }} disabled={!content}>
@@ -273,17 +499,19 @@ function App() {
               </div>
             </div>
             <div className="document-bar">
-              <div className="filename-wrap"><FileJson size={15} /><input aria-label="Document filename" value={fileName} onChange={(event) => setFileName(event.target.value)} /></div>
-              <span className="format-chip">{activeFormat.label}</span>
+              {isFormatter
+                ? <div className="filename-wrap"><FileJson size={15} /><input aria-label="Document filename" value={fileName} onChange={(event) => setFileName(event.target.value)} /></div>
+                : <span className="utility-input-label">{toolDetails.input}</span>}
+              <span className="format-chip">{isFormatter ? activeFormat.label : toolMode === 'jwtDecode' ? 'JWT' : 'BASE64 URL'}</span>
             </div>
-            <label className="visually-hidden" htmlFor="document-input">Unformatted {activeFormat.label} content</label>
+            <label className="visually-hidden" htmlFor="document-input">{toolDetails.input}</label>
             <textarea
               id="document-input"
               className="code-input"
               spellCheck="false"
               autoCapitalize="off"
               autoCorrect="off"
-              placeholder={`Paste your ${activeFormat.label} here...`}
+              placeholder={toolDetails.placeholder}
               value={content}
               onChange={(event) => updateContent(event.target.value)}
             />
@@ -291,6 +519,7 @@ function App() {
               <span className={byteCount > MAX_BYTES ? 'size-warning' : ''}>{byteCount.toLocaleString()} bytes <span className="footer-divider">/</span> 1 MiB</span>
               <span>{content.length.toLocaleString()} characters</span>
             </div>
+            {toolMode === 'jwtDecode' && <p className="utility-warning">The token is sent to the configured API. Decoding does not verify its signature or validate claims.</p>}
           </article>
 
           <div className="process-rail" aria-hidden="true"><span><ChevronDown size={17} /></span></div>
@@ -309,15 +538,35 @@ function App() {
             </div>
             <div className="result-bar">
               <div className="view-switch" role="tablist" aria-label="Result view">
-                <button className={outputMode === 'preview' ? 'selected' : ''} type="button" role="tab" aria-selected={outputMode === 'preview'} onClick={() => setOutputMode('preview')}><PanelTop size={14} /> Preview</button>
+                {supportsPreview && <button className={outputMode === 'preview' ? 'selected' : ''} type="button" role="tab" aria-selected={outputMode === 'preview'} onClick={() => setOutputMode('preview')}><PanelTop size={14} /> Preview</button>}
                 <button className={outputMode === 'source' ? 'selected' : ''} type="button" role="tab" aria-selected={outputMode === 'source'} onClick={() => setOutputMode('source')}><Code2 size={14} /> Source</button>
+                {supportsTree && <button className={outputMode === 'tree' ? 'selected' : ''} type="button" role="tab" aria-selected={outputMode === 'tree'} onClick={() => setOutputMode('tree')}><Braces size={14} /> Tree</button>}
               </div>
-              <span className="result-type">{outputMode === 'preview' ? 'RENDERED VIEW' : 'FORMATTED SOURCE'}</span>
+              {outputMode === 'tree' && result && structuredTree?.tree ? (
+                <div className="tree-actions">
+                  <button type="button" onClick={() => setExpandedNodes(Object.fromEntries(collectBranchIds(structuredTree.tree).map((id) => [id, true])))}>
+                    <Expand size={12} /> Expand all
+                  </button>
+                  <button type="button" onClick={() => setExpandedNodes(Object.fromEntries(collectBranchIds(structuredTree.tree).map((id) => [id, false])))}>
+                    <Shrink size={12} /> Collapse all
+                  </button>
+                </div>
+              ) : (
+                <span className="result-type">{outputMode === 'preview' ? 'RENDERED VIEW' : outputMode === 'tree' ? 'STRUCTURED TREE' : isFormatter ? 'FORMATTED SOURCE' : 'UTILITY OUTPUT'}</span>
+              )}
             </div>
             <div className={`result-content ${outputMode === 'preview' ? 'preview-content' : ''}`}>
               {result ? (
-                outputMode === 'preview' ? (
+                supportsPreview && outputMode === 'preview' ? (
                   <iframe className="preview-frame" title={`${activeFormat.label} rendered preview`} sandbox="" srcDoc={getPreviewDocument(result.previewHtml)} />
+                ) : outputMode === 'tree' && supportsTree ? (
+                  structuredTree.error ? (
+                    <div className="tree-error">Could not display the tree: {structuredTree.error}. Switch to Source to view the formatted text.</div>
+                  ) : (
+                    <div className="structured-tree">
+                      <TreeNode node={structuredTree.tree} expandedNodes={expandedNodes} setExpandedNodes={setExpandedNodes} />
+                    </div>
+                  )
                 ) : (
                   <pre className="code-output"><code>{result.formattedContent}</code></pre>
                 )
@@ -328,7 +577,7 @@ function App() {
                   <span>Ready when you are</span>
                 </div>
               )}
-              {busy && <div className="loading-overlay"><LoaderCircle size={23} className="spinner" /><span>Processing {activeFormat.label}...</span></div>}
+              {busy && <div className="loading-overlay"><LoaderCircle size={23} className="spinner" /><span>Processing {toolDetails.label}...</span></div>}
             </div>
             <div className="editor-footer result-footer">
               <span>{result ? `${(result.characterCount ?? 0).toLocaleString()} input characters` : 'Output will appear here'}</span>
@@ -339,11 +588,11 @@ function App() {
 
         <div className="action-row">
           <div className="feedback" aria-live="polite">
-            {error ? <><CircleAlert size={15} /><span>{error}</span></> : notice ? <><Check size={15} /><span>{notice}</span></> : <span className="quiet-feedback">{format === 'html' || format === 'markdown' ? 'Preview is isolated in a sandbox' : 'Source is formatted by the dev-utils API'}</span>}
+            {error ? <><CircleAlert size={15} /><span>{error}</span></> : notice ? <><Check size={15} /><span>{notice}</span></> : <span className="quiet-feedback">{toolMode === 'jwtDecode' ? 'JWT decode does not verify the signature' : toolMode === 'base64Encode' ? 'Encodes as unpadded Base64 URL-safe text' : toolMode === 'base64Decode' ? 'Decodes Base64 URL-safe text' : supportsPreview ? 'Preview is isolated in a sandbox' : 'Source is formatted by the dev-utils API'}</span>}
           </div>
           <button className="button button-primary process-button" type="button" onClick={processDocument} disabled={busy || !content.trim()}>
             {busy ? <LoaderCircle size={16} className="spinner" /> : <Sparkles size={16} />}
-            <span>{busy ? 'Formatting...' : 'Format document'}</span>
+            <span>{busy ? 'Processing...' : isFormatter ? 'Format document' : toolDetails.label}</span>
           </button>
         </div>
         <div className="workspace-bottom"><span>JSON <i /> HTML <i /> XML <i /> MARKDOWN</span><span>LOCAL INPUT <i /> NO FILES STORED</span></div>
